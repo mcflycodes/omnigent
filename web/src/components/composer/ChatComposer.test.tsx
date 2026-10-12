@@ -64,6 +64,27 @@ describe("ChatComposer", () => {
     );
   });
 
+  it("uses the theme primary color for an enabled send action", () => {
+    render(<ComposerSendButton label="Send" />);
+    expect(screen.getByRole("button", { name: "Send" })).toHaveClass(
+      "bg-primary",
+      "text-primary-foreground",
+      "disabled:bg-muted",
+      "disabled:text-muted-foreground",
+    );
+  });
+
+  it("uses the same button size in send and interrupt states", () => {
+    const { rerender } = render(<ComposerSendButton label="Send" />);
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(send).toHaveClass("size-8");
+    expect(send.className).toContain("md:size-7");
+    rerender(<ComposerSendButton label="Interrupt" interrupt />);
+    const interrupt = screen.getByRole("button", { name: "Interrupt" });
+    expect(interrupt).toHaveClass("size-8");
+    expect(interrupt.className).toContain("md:size-7");
+  });
+
   it("places context, overlays, attachments and controls around the same input", () => {
     const cardRef = createRef<HTMLDivElement>();
     render(
@@ -132,11 +153,32 @@ describe("ChatComposer", () => {
     expect(onKeyDown).toHaveBeenLastCalledWith(expect.anything(), {
       shouldSubmitFromKeyboard: false,
       shouldPreferSendOverCompletion: false,
+      shouldSteerAllFromKeyboard: false,
     });
     fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
     expect(onKeyDown).toHaveBeenLastCalledWith(expect.anything(), {
       shouldSubmitFromKeyboard: true,
       shouldPreferSendOverCompletion: true,
+      shouldSteerAllFromKeyboard: false,
+    });
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true, shiftKey: true });
+    expect(onKeyDown).toHaveBeenLastCalledWith(expect.anything(), {
+      shouldSubmitFromKeyboard: false,
+      shouldPreferSendOverCompletion: false,
+      shouldSteerAllFromKeyboard: true,
+    });
+    onKeyDown.mockClear();
+    rerender(
+      <ChatComposer
+        {...props}
+        keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+      />,
+    );
+    fireEvent.keyDown(input, { key: "Enter", metaKey: true });
+    expect(onKeyDown).toHaveBeenLastCalledWith(expect.anything(), {
+      shouldSubmitFromKeyboard: true,
+      shouldPreferSendOverCompletion: false,
+      shouldSteerAllFromKeyboard: true,
     });
     onKeyDown.mockClear();
     rerender(
@@ -147,6 +189,51 @@ describe("ChatComposer", () => {
     );
     expect(fireEvent.keyDown(input, { key: "Enter", ctrlKey: true })).toBe(true);
     expect(onKeyDown).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [false, false],
+    [true, false],
+    [false, true],
+  ])(
+    "inserts a line break at the caret on Alt+Enter (mod-enter: %s, touch: %s)",
+    (submitWithModEnter, preventsKeyboardSubmit) => {
+      const onKeyDown = vi.fn();
+      const onChange = vi.fn();
+      render(
+        <ChatComposer
+          keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
+          input={{ "aria-label": "Draft", defaultValue: "firstsecond", onChange, onKeyDown }}
+          actions={{ leading: null, trailing: null }}
+        />,
+      );
+      const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+      input.setSelectionRange(5, 5);
+
+      expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(false);
+      expect(input).toHaveValue("first\nsecond");
+      expect(input.selectionStart).toBe(6);
+      expect(onChange).toHaveBeenCalledOnce();
+      // Menus and send chords never see it, so it can't complete or submit.
+      expect(onKeyDown).not.toHaveBeenCalled();
+    },
+  );
+
+  it("leaves Alt chords with Ctrl/Cmd, or mid-composition, to the browser", () => {
+    const onKeyDown = vi.fn();
+    render(
+      <ChatComposer
+        keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+        input={{ "aria-label": "Draft", defaultValue: "draft", onKeyDown }}
+        actions={{ leading: null, trailing: null }}
+      />,
+    );
+    const input = screen.getByRole("textbox");
+    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true, ctrlKey: true })).toBe(true);
+    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true, metaKey: true })).toBe(true);
+    fireEvent.compositionStart(input);
+    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(true);
+    expect(input).toHaveValue("draft");
   });
 });
 
