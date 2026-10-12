@@ -188,6 +188,17 @@ async def _drive_codex_probe_failure(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+async def _select_entry_agent(page, agent_id: str) -> None:
+    """Select a harness so its host catalog loads before its Edit row opens."""
+    picker = page.get_by_test_id("new-chat-landing-agent-select")
+    await picker.click()
+    row = page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
+    if await row.count() == 0:
+        await page.get_by_test_id("new-chat-landing-harness-more").click()
+    await row.click()
+    await expect(picker).to_have_attribute("aria-expanded", "false")
+
+
 def test_antigravity_launch_picker_posts_selected_model(
     seeded_session: tuple[str, str],
     tmp_path: Path,
@@ -254,13 +265,14 @@ async def _drive_antigravity_launch_picker(
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Start on Claude, then use Antigravity's Edit row. This exercises
-            # the catalog when its harness is not the landing default.
+            # Start on Claude, select Antigravity, then use its Edit row. This
+            # exercises the catalog when its harness is not the landing default.
             assert (
                 await page.get_by_test_id("new-chat-landing-agent-select").get_attribute(
                     "aria-label"
                 )
             ).startswith("Claude Code,")
+            await _select_entry_agent(page, "ag_antigravity_e2e")
             await _open_entry_models(page, "ag_antigravity_e2e")
             models = page.get_by_test_id("new-chat-landing-agent-models")
             await expect(models).to_contain_text("Gemini 3.5 Pro")
