@@ -2309,8 +2309,9 @@ def _harness_vendor_key(canon: str) -> str:
     ``"claude"`` and ``codex`` / ``codex-native`` to ``"gpt"``. Multi-model
     harnesses have no single family, so they key on the base name with
     ``-native`` dropped (``pi`` ↔ ``pi-native``, ``opencode`` ↔
-    ``opencode-native``). The ``_``→``-`` fold lets the executor-type spelling
-    ``claude_sdk`` resolve to the ``claude-sdk`` capability row.
+    ``opencode-native``), unless their SDK twin has one family
+    (``antigravity-native`` ↔ ``antigravity``). The ``_``→``-`` fold lets the
+    executor-type spelling ``claude_sdk`` resolve to the ``claude-sdk`` row.
 
     :param canon: A canonical harness id, e.g. ``"claude-sdk"``.
     :returns: The vendor key, e.g. ``"claude"``.
@@ -2320,9 +2321,13 @@ def _harness_vendor_key(canon: str) -> str:
 
     caps = harness_capabilities()
     cap = caps.get(canon) or caps.get(canon.replace("_", "-"))
+    base = native_terminal_name(canon)
+    if cap is not None and cap.model_family is ModelFamily.MULTI and base is not None:
+        # A multi-model native CLI keys like its single-vendor SDK twin.
+        cap = caps.get(base, cap)
     if cap is not None and cap.model_family is not ModelFamily.MULTI:
         return cap.model_family.value
-    return native_terminal_name(canon) or canon
+    return base or canon
 
 
 def _child_is_foreign_harness(child_harness: str, parent_harness: object) -> bool:

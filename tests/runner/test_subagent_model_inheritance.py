@@ -360,6 +360,39 @@ async def test_antigravity_native_discovery_failure_keeps_worker_default(
     assert "model_override" not in bodies[0]
 
 
+@pytest.mark.parametrize(
+    ("parent_harness", "child_harness"),
+    (("antigravity", "antigravity-native"), ("antigravity-native", "antigravity")),
+    ids=("sdk-to-native", "native-to-sdk"),
+)
+@pytest.mark.asyncio
+async def test_antigravity_sdk_native_split_inherits_advertised_model(
+    monkeypatch: pytest.MonkeyPatch,
+    parent_harness: str,
+    child_harness: str,
+) -> None:
+    """SDK and native Antigravity share a vendor, so an advertised id inherits."""
+    from omnigent.harnesses.antigravity_native import models
+
+    monkeypatch.setattr(models, "agy_binary_path", lambda: "/test/agy")
+    probe = Mock(
+        return_value=subprocess.CompletedProcess(
+            ["/test/agy", "models"],
+            0,
+            stdout="Fetching available models...\ngemini-3.5-pro\tGemini 3.5 Pro\n",
+        )
+    )
+    monkeypatch.setattr(models.subprocess, "run", probe)
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker(child_harness),
+        conv_id=f"conv_antigravity_split_{parent_harness}",
+        parent_snapshot={"harness": parent_harness, "model_override": "gemini-3.5-pro"},
+    )
+
+    assert bodies[0]["model_override"] == "gemini-3.5-pro"
+
+
 @pytest.mark.asyncio
 async def test_antigravity_native_child_without_model_keeps_agy_default(
     monkeypatch: pytest.MonkeyPatch,
