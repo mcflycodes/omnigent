@@ -11113,6 +11113,34 @@ describe("managed sandbox gateway preview", () => {
     );
   });
 
+  it("offers a provider's Antigravity models and efforts instead of host CLI groups", async () => {
+    preview();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      testAgent("a_agy", "antigravity-native-ui", {
+        display_name: "Antigravity",
+        harness: "antigravity-native",
+      }),
+    ]);
+    localStorage.setItem(LAST_AGENT_KEY, "a_agy");
+    renderGatewaySandbox();
+    openAgentModels("a_agy");
+    pickPrimaryOption("model", "Astra 6");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-max"));
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      agent_id: "a_agy",
+      sandbox_provider: "arclet",
+      model_override: astra.id,
+      reasoning_effort: "max",
+    });
+  });
+
   it.each(["unavailable", "empty"] as const)(
     "offers an intentional harness default when gateway discovery is %s",
     async (status) => {

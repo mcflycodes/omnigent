@@ -3295,7 +3295,7 @@ export function NewChatLandingScreen() {
   const antigravityModelOptions = useMemo(
     () =>
       sandboxSelected
-        ? []
+        ? (sandboxCatalog ?? [])
         : (availableAntigravityModels ?? []).map((option) => ({
             id: option.id,
             model: option.model,
@@ -3303,14 +3303,17 @@ export function NewChatLandingScreen() {
             isDefault: option.isDefault,
             source: option.source,
           })),
-    [availableAntigravityModels, sandboxSelected],
+    [availableAntigravityModels, sandboxSelected, sandboxCatalog],
   );
+  // Grouping and exact-id efforts apply only to agy's host CLI catalog; a
+  // sandbox provider's catalog keeps the shared picker behavior.
+  const antigravityHostCatalog = selectedNativeHarness === "antigravity-native" && !sandboxSelected;
   // agy advertises effort as part of some launch ids. Collapse only genuine
   // sibling ids into a model plus effort UI; each choice still launches the
   // exact id the CLI advertised.
   const antigravityPickerGroups = useMemo(
-    () => antigravityModelGroups(antigravityModelOptions),
-    [antigravityModelOptions],
+    () => (sandboxSelected ? [] : antigravityModelGroups(antigravityModelOptions)),
+    [antigravityModelOptions, sandboxSelected],
   );
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsDevinMode = nativeAgentHasCapability(selectedAgent, "devinMode");
@@ -3789,10 +3792,9 @@ export function NewChatLandingScreen() {
       });
       return;
     }
-    const agyGroup =
-      selectedNativeHarness === "antigravity-native"
-        ? antigravityPickerGroups.find((group) => group.id === model)
-        : null;
+    const agyGroup = antigravityHostCatalog
+      ? antigravityPickerGroups.find((group) => group.id === model)
+      : null;
     const retainedAgyEffort = selectedAntigravityPickerGroup?.efforts.find(
       (effort) => effort.modelId === pickedModel,
     )?.value;
@@ -3813,7 +3815,7 @@ export function NewChatLandingScreen() {
         effortModel,
       ).includes(pickedEffort)
         ? ""
-        : selectedNativeHarness === "antigravity-native"
+        : antigravityHostCatalog
           ? (agyGroup?.efforts.find((candidate) => candidate.modelId === picked)?.value ?? "")
           : pickedEffort;
     setPickedModel(picked);
@@ -3825,7 +3827,7 @@ export function NewChatLandingScreen() {
     const selectionHarness =
       selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : null);
     if (!selectionHarness) return;
-    if (selectedNativeHarness === "antigravity-native") {
+    if (antigravityHostCatalog) {
       const selected = selectedAntigravityPickerGroup?.efforts.find(
         (candidate) => candidate.value === effort,
       );
@@ -3833,7 +3835,7 @@ export function NewChatLandingScreen() {
       userPickedModelRef.current = true;
       setPickedModel(selected.modelId);
       setPickedEffort(selected.value);
-      rememberPickerOptions(selectedNativeHarness, {
+      rememberPickerOptions(selectionHarness, {
         model: selected.modelId,
         effort: selected.value,
       });
@@ -3999,7 +4001,7 @@ export function NewChatLandingScreen() {
                       : []),
                     // Antigravity groups are model rows without Devin's Fusion payload.
                     ...(
-                      (selectedNativeHarness === "antigravity-native"
+                      (antigravityHostCatalog
                         ? antigravityPickerGroups
                         : pickerModelOptions) as readonly NativeModelOption[]
                     )
@@ -4017,7 +4019,7 @@ export function NewChatLandingScreen() {
                         label: visibleModelLabel(nativeModelLabel(option)),
                         checked:
                           !routingOn &&
-                          ((selectedNativeHarness === "antigravity-native" &&
+                          ((antigravityHostCatalog &&
                             selectedAntigravityPickerGroup?.id === option.id) ||
                             (option.fusion !== undefined
                               ? isFusionModelUid(pickedModel) ||
@@ -4031,7 +4033,7 @@ export function NewChatLandingScreen() {
                           ? () => selectFusionModel(option.fusion!.default)
                           : () =>
                               selectPickerModel(
-                                selectedNativeHarness !== "antigravity-native" && option.isDefault
+                                !antigravityHostCatalog && option.isDefault
                                   ? MODEL_SELECT_DEFAULT
                                   : option.id,
                               ),
@@ -4138,7 +4140,7 @@ export function NewChatLandingScreen() {
       const effort =
         native.iconKind === "codex"
           ? normalizeEffortLabel(saved.effort ?? "")
-          : native.iconKind === "antigravity"
+          : native.iconKind === "antigravity" && !sandboxSelected
             ? agyGroup?.efforts.find((candidate) => candidate.modelId === saved.model)?.label
             : efforts.find((option) => option.value === saved.effort)?.label;
       return [agent.id, [compactModelTriggerLabel(label), effort].filter(Boolean).join(" ")];
@@ -4282,7 +4284,7 @@ export function NewChatLandingScreen() {
           : "",
       );
     }
-    if (selectedNativeHarness === "antigravity-native") {
+    if (antigravityHostCatalog) {
       // agy consumes the exact suffixed model id at launch. The effort UI is
       // derived from that id, so no separate runner `reasoning_effort` exists.
       const seededAgyModel =
