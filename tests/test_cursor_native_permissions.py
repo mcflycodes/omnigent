@@ -29,6 +29,7 @@ import hashlib
 import json as _json
 import os
 import sqlite3 as _sqlite3
+import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -812,21 +813,37 @@ async def test_supervise_transcript_reuses_scan_between_polls(
         store,
         [_json.dumps(_tool_result_obj(f"call_{i}")).encode() for i in range(20)],
     )
-    polls = 0
+    # Polls run in worker threads; count finished and running ones, never time them.
+    progress = threading.Condition()
+    polls = in_flight = 0
 
     def _read(store_path: Path, scan: cnp.CursorPendingScan | None = None) -> list:
-        nonlocal polls
-        polls += 1
-        return read_cursor_pending_tool_calls(store_path, scan)
+        nonlocal polls, in_flight
+        with progress:
+            in_flight += 1
+        try:
+            return read_cursor_pending_tool_calls(store_path, scan)
+        finally:
+            with progress:
+                in_flight -= 1
+                polls += 1
+                progress.notify_all()
+
+    def _wait_until(predicate: Callable[[], bool]) -> bool:
+        # The timeout only guards against a hang; it never decides the result.
+        with progress:
+            return progress.wait_for(predicate, timeout=120)
 
     monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", _read)
     parsed = _count_parsed_blobs(monkeypatch)
     _statements, connections = _trace_store_connections(monkeypatch)
     task = _start_supervisor(tmp_path, session_id="conv_idle", auto_accept_approvals=False)
     try:
-        assert await _wait_for(lambda: polls >= 5)
+        assert await asyncio.to_thread(_wait_until, lambda: polls >= 5)
     finally:
         await _stop(task)
+    # A poll cancelled mid-read keeps running in its thread; let it finish.
+    assert await asyncio.to_thread(_wait_until, lambda: in_flight == 0)
     assert parsed[0] == 20
     # The kept store connection does not outlive the supervisor.
     assert len(connections) == 1 and _is_closed(connections[0])
