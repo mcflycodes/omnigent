@@ -43,6 +43,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -488,32 +489,71 @@ class CursorPendingScan:
 
     Cursor keys each blob on a hash of its data and never updates a row in
     place, but it can delete rows, re-write a blob at a new rowid, or reuse a
-    freed rowid. So each read also checks a digest of the ``(rowid, id)`` pairs
-    at or below ``last_rowid`` (equal pairs mean equal rows, since ids are
-    content hashes); any change there, or a replaced file, triggers a full
-    rescan, so the result always equals a scan from row 0.
+    freed rowid. So after any change, a read checks a digest of the
+    ``(rowid, id)`` pairs at or below ``last_rowid`` (equal pairs mean equal
+    rows, since ids are content hashes); a mismatch, or a replaced file,
+    triggers a full rescan, so the result always equals a scan from row 0.
+
+    A read that finds the store unchanged does constant work: the files' stat
+    signature must match and ``PRAGMA data_version`` must match on the
+    connection kept from the last read (it changes whenever any other
+    connection commits). Stat catches rewrites made outside SQLite, which can
+    leave ``data_version`` and that connection's page cache stale, so every
+    other read opens a fresh connection.
 
     Folded state keeps calls still pending (first-seen order, latest args) and
     the ids already committed or resolved, which can never become pending
     again. ``finished`` grows by one id per tool call (about 140 bytes each)
     for the supervisor's life; evicting one would let a late marker resurface
     a finished call.
+
+    Reads are serialized by a lock and may run on any thread. ``close()`` (or
+    leaving ``async with``) releases the connection; during a read, the read
+    releases it when done.
     """
 
     store_path: Path | None
     file_id: tuple[int, int] | None
+    signature: _StoreSignature | None
     last_rowid: int
     prefix_digest: bytes | None
     pending: dict[str, CursorPendingToolCall]
     finished: set[str]
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._closed = False
+        self._connection: sqlite3.Connection | None = None
+        self._data_version: int | None = None
         self.reset(None, None)
+
+    async def __aenter__(self) -> CursorPendingScan:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Release the kept connection now, or when the read in progress ends."""
+        self._closed = True
+        if self._lock.acquire(blocking=False):
+            try:
+                self._close_connection()
+            finally:
+                self._lock.release()
+
+    def _close_connection(self) -> None:
+        if self._connection is not None:
+            self._connection.close()
+        self._connection = None
+        self._data_version = None
 
     def reset(self, store_path: Path | None, file_id: tuple[int, int] | None) -> None:
         """Forget everything folded so far; the next read starts from row 0."""
+        self._close_connection()
         self.store_path = store_path
         self.file_id = file_id
+        self.signature = None
         self.last_rowid = 0
         self.prefix_digest = None
         self.pending = {}
@@ -558,74 +598,131 @@ class CursorPendingScan:
 
     def read(self, store_path: Path) -> list[CursorPendingToolCall]:
         """Fold the rows added since the last read and return pending calls."""
-        try:
-            stat = store_path.stat()
-        except OSError:
+        with self._lock:
+            try:
+                return self._read(store_path)
+            finally:
+                if self._closed:
+                    self._close_connection()
+
+    def _read(self, store_path: Path) -> list[CursorPendingToolCall]:
+        signature = _store_signature(store_path)
+        if signature is None:
             self.reset(None, None)
             return []
-        file_id = (stat.st_dev, stat.st_ino)
+        file_id = signature[0]
         if store_path != self.store_path or file_id != self.file_id:
             self.reset(store_path, file_id)
-        snapshot = _read_store_snapshot(store_path, self.last_rowid)
-        if snapshot is not None and self.prefix_digest is not None:
-            prefix_digest, _store_digest, _rows = snapshot
-            if prefix_digest != self.prefix_digest:
-                # Rows at or below the high-water mark changed since the last read.
-                self.reset(store_path, file_id)
-                snapshot = _read_store_snapshot(store_path, 0)
-        if snapshot is None:
+        if signature == self.signature and self._data_version_unchanged():
+            return self.calls()
+        self._close_connection()
+        opened = _open_store_snapshot(store_path, self.last_rowid)
+        if opened is None:
             # Same answer as a failed full scan; start over on the next read.
             self.reset(None, None)
             return []
-        _prefix_digest, store_digest, rows = snapshot
+        self._connection, snapshot = opened
+        data_version, prefix_digest, store_digest, rows = snapshot
+        if self.prefix_digest is not None and prefix_digest != self.prefix_digest:
+            # Rows at or below the high-water mark changed since the last read.
+            self.reset(store_path, file_id)
+            return self._read(store_path)
         try:
             self.fold(rows)
         except Exception:
             self.reset(None, None)
             raise
+        self.signature = signature
+        self._data_version = data_version
         # Every row in this snapshot is now folded, so the new prefix is all of it.
         self.prefix_digest = store_digest
         if rows:
             self.last_rowid = rows[-1][0]
         return self.calls()
 
+    def _data_version_unchanged(self) -> bool:
+        if self._connection is None or self._data_version is None:
+            return False
+        try:
+            (data_version,) = self._connection.execute("PRAGMA data_version").fetchone()
+        except sqlite3.Error:
+            return False
+        return data_version == self._data_version
 
-# Canonical ``(rowid, id)`` pairs up to a rowid. ``+rowid`` keeps the planner on
-# the small ``id`` index instead of the blob pages; ``quote`` keeps it unambiguous.
-_ROWID_PAIRS_SQL = "SELECT group_concat(rowid || ':' || quote(id)) FROM blobs WHERE +rowid <= ?"
+
+# ``(st_dev, st_ino)`` of ``store.db``, its size and mtime, and the same for ``-wal``.
+_StoreSignature = tuple[tuple[int, int], int, int, tuple[int, int, int] | None]
 
 
-def _read_store_snapshot(
+def _store_signature(store_path: Path) -> _StoreSignature | None:
+    """Return the stat signature of *store_path* and its WAL, or ``None`` if missing."""
+    try:
+        db = store_path.stat()
+    except OSError:
+        return None
+    try:
+        wal = store_path.with_name(store_path.name + "-wal").stat()
+    except OSError:
+        wal_signature = None
+    else:
+        wal_signature = (wal.st_ino, wal.st_size, wal.st_mtime_ns)
+    return (db.st_dev, db.st_ino), db.st_size, db.st_mtime_ns, wal_signature
+
+
+def _open_store_snapshot(
     store_path: Path, last_rowid: int
-) -> tuple[bytes, bytes, list[tuple[int, str, object]]] | None:
-    """Read ``(prefix digest, store digest, rows after last_rowid)`` from one snapshot.
+) -> tuple[sqlite3.Connection, tuple[int, bytes, bytes, list[tuple[int, str, object]]]] | None:
+    """Open a fresh connection and read one snapshot through it.
 
-    The digests cover the ``(rowid, id)`` pairs at or below ``last_rowid`` and
-    in the whole table. Connects like :func:`_read_blob_rows` (WAL-aware
-    ``mode=ro``, then a plain connection) in one read transaction, so the
-    digests and the new rows agree. Returns ``None`` when the store can't be read.
+    Tries the WAL-aware ``mode=ro`` URI first and a plain connection second,
+    like :func:`_read_blob_rows`. Returns the open connection with the snapshot
+    (see :func:`_read_store_snapshot`), or ``None`` when the store can't be read.
     """
     for uri, use_uri in ((f"file:{store_path}?mode=ro", True), (str(store_path), False)):
         try:
-            con = sqlite3.connect(uri, timeout=5.0, uri=use_uri, isolation_level=None)
+            connection = sqlite3.connect(
+                uri, timeout=5.0, uri=use_uri, isolation_level=None, check_same_thread=False
+            )
         except sqlite3.Error:
             continue
+        snapshot = _read_store_snapshot(connection, last_rowid)
+        if snapshot is not None:
+            return connection, snapshot
+        connection.close()
+    return None
+
+
+def _read_store_snapshot(
+    connection: sqlite3.Connection, last_rowid: int
+) -> tuple[int, bytes, bytes, list[tuple[int, str, object]]] | None:
+    """Read ``(data_version, prefix digest, store digest, new rows)`` in one transaction.
+
+    ``data_version`` is read first, no later than the snapshot starts, so any
+    commit the snapshot misses changes it. The digests cover the
+    ``(rowid, id)`` pairs at or below ``last_rowid`` and in the whole table;
+    the new rows are those after ``last_rowid``.
+    """
+    try:
+        connection.execute("BEGIN")
         try:
-            con.execute("BEGIN")
-            (prefix,) = con.execute(_ROWID_PAIRS_SQL, (last_rowid,)).fetchone()
-            rows = con.execute(
+            (data_version,) = connection.execute("PRAGMA data_version").fetchone()
+            # Unordered, so SQLite can read just the small ``id`` index; sorted below.
+            pairs = connection.execute("SELECT rowid, id FROM blobs").fetchall()
+            rows = connection.execute(
                 "SELECT rowid, id, data FROM blobs WHERE rowid > ? ORDER BY rowid", (last_rowid,)
             ).fetchall()
-            pairs = con.execute(_ROWID_PAIRS_SQL, (rows[-1][0],)).fetchone()[0] if rows else prefix
-        except sqlite3.Error:
-            continue
         finally:
-            con.close()
-        prefix_digest = hashlib.sha256(str(prefix or "").encode("utf-8")).digest()
-        if not rows:
-            return prefix_digest, prefix_digest, rows
-        return prefix_digest, hashlib.sha256(str(pairs or "").encode("utf-8")).digest(), rows
-    return None
+            connection.execute("COMMIT")
+    except sqlite3.Error:
+        return None
+    pairs.sort()  # rowids are unique, so this orders by rowid alone
+    # Pairs after last_rowid are exactly the new rows, read in the same snapshot.
+    # Each pair's repr is self-delimiting, so the prefix hash extends to the store's.
+    split = len(pairs) - len(rows)
+    hasher = hashlib.sha256("".join(map(repr, pairs[:split])).encode("utf-8"))
+    prefix_digest = hasher.digest()
+    hasher.update("".join(map(repr, pairs[split:])).encode("utf-8"))
+    return data_version, prefix_digest, hasher.digest(), rows
 
 
 def read_cursor_pending_tool_calls(
@@ -972,7 +1069,6 @@ async def supervise_cursor_transcript_elicitations(
     # still inside the settle window (not yet surfaced).
     active: dict[str, dict[str, object]] = {}
     first_seen: dict[str, float] = {}
-    scan = CursorPendingScan()
     auto_accept_attempts: dict[str, _YoloAcceptRetry] = {}
     next_auto_accept_at = 0.0
     store_path: Path | None = None
@@ -980,7 +1076,10 @@ async def supervise_cursor_transcript_elicitations(
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
 
-    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+    async with (
+        open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
+        CursorPendingScan() as scan,
+    ):
         while True:
             try:
                 if store_path is None or not store_path.exists():
