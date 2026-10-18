@@ -42,6 +42,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -482,7 +483,144 @@ def _pending_started_ms(obj: dict[str, object]) -> int | None:
     return marker if isinstance(marker, int) else None
 
 
-def read_cursor_pending_tool_calls(store_path: Path) -> list[CursorPendingToolCall]:
+class CursorPendingScan:
+    """Per-supervisor state that lets each poll read only the new store rows.
+
+    Cursor writes blobs with ``INSERT OR REPLACE`` keyed on a content hash and
+    never updates a row in place, so rows only append. A re-written blob is
+    deleted and re-appended at a new rowid, which lowers the count of rows at
+    or below ``last_rowid``; that, a different blob at ``last_rowid``, or a
+    replaced file triggers a full rescan, so the result always equals a scan
+    from row 0.
+
+    Folded state keeps calls still pending (first-seen order, latest args) and
+    the ids already committed or resolved, which can never become pending
+    again.
+    """
+
+    store_path: Path | None
+    file_id: tuple[int, int] | None
+    last_rowid: int
+    last_blob_id: str | None
+    row_count: int
+    pending: dict[str, CursorPendingToolCall]
+    finished: set[str]
+
+    def __init__(self) -> None:
+        self.reset(None, None)
+
+    def reset(self, store_path: Path | None, file_id: tuple[int, int] | None) -> None:
+        """Forget everything folded so far; the next read starts from row 0."""
+        self.store_path = store_path
+        self.file_id = file_id
+        self.last_rowid = 0
+        self.last_blob_id = None
+        self.row_count = 0
+        self.pending = {}
+        self.finished = set()
+
+    def fold(self, rows: list[tuple[int, str, object]]) -> None:
+        """Apply blob rows, in rowid order, to the pending / finished state."""
+        for _rowid, _blob_id, data in rows:
+            if isinstance(data, (bytes, bytearray)):
+                raw = bytes(data)
+            else:
+                raw = str(data).encode("utf-8")
+            for obj in _iter_embedded_json_objects(raw):
+                content = obj.get("content")
+                if not isinstance(content, list):
+                    continue
+                marker = _pending_started_ms(obj)
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = part.get("type")
+                    tool_call_id = part.get("toolCallId")
+                    if not isinstance(tool_call_id, str):
+                        continue
+                    if part_type == "tool-call" and marker is not None:
+                        if tool_call_id in self.finished:
+                            continue
+                        tool_name = part.get("toolName")
+                        args = part.get("args")
+                        self.pending[tool_call_id] = CursorPendingToolCall(
+                            tool_call_id=tool_call_id,
+                            tool_name=tool_name if isinstance(tool_name, str) else "tool",
+                            args=args if isinstance(args, dict) else {},
+                        )
+                    elif part_type in ("tool-call", "tool-result"):
+                        self.finished.add(tool_call_id)
+                        self.pending.pop(tool_call_id, None)
+
+    def calls(self) -> list[CursorPendingToolCall]:
+        """Return the calls still awaiting a human, in first-seen order."""
+        return list(self.pending.values())
+
+    def read(self, store_path: Path) -> list[CursorPendingToolCall]:
+        """Fold the rows added since the last read and return pending calls."""
+        try:
+            stat = store_path.stat()
+        except OSError:
+            self.reset(None, None)
+            return []
+        file_id = (stat.st_dev, stat.st_ino)
+        if store_path != self.store_path or file_id != self.file_id:
+            self.reset(store_path, file_id)
+        delta = _read_store_delta(store_path, self.last_rowid)
+        if delta is not None:
+            row_count, blob_id_at_last, rows = delta
+            if blob_id_at_last != self.last_blob_id or row_count - len(rows) != self.row_count:
+                # Rows at or below the high-water mark changed since the last read.
+                self.reset(store_path, file_id)
+                delta = _read_store_delta(store_path, 0)
+        if delta is None:
+            # Same answer as a failed full scan; start over on the next read.
+            self.reset(None, None)
+            return []
+        row_count, _blob_id_at_last, rows = delta
+        try:
+            self.fold(rows)
+        except Exception:
+            self.reset(None, None)
+            raise
+        self.row_count = row_count
+        if rows:
+            self.last_rowid, self.last_blob_id = rows[-1][0], rows[-1][1]
+        return self.calls()
+
+
+def _read_store_delta(
+    store_path: Path, last_rowid: int
+) -> tuple[int, str | None, list[tuple[int, str, object]]] | None:
+    """Read ``(row count, id at last_rowid, rows after it)`` from one snapshot.
+
+    Connects like :func:`_read_blob_rows` (WAL-aware ``mode=ro``, then a plain
+    connection) and runs every query in one read transaction, so the count and
+    the new rows agree. Returns ``None`` when the store can't be read.
+    """
+    for uri, use_uri in ((f"file:{store_path}?mode=ro", True), (str(store_path), False)):
+        try:
+            con = sqlite3.connect(uri, timeout=5.0, uri=use_uri, isolation_level=None)
+        except sqlite3.Error:
+            continue
+        try:
+            con.execute("BEGIN")
+            (row_count,) = con.execute("SELECT COUNT(*) FROM blobs").fetchone()
+            at_last = con.execute("SELECT id FROM blobs WHERE rowid = ?", (last_rowid,)).fetchone()
+            rows = con.execute(
+                "SELECT rowid, id, data FROM blobs WHERE rowid > ? ORDER BY rowid", (last_rowid,)
+            ).fetchall()
+            return int(row_count), at_last[0] if at_last else None, rows
+        except sqlite3.Error:
+            continue
+        finally:
+            con.close()
+    return None
+
+
+def read_cursor_pending_tool_calls(
+    store_path: Path, scan: CursorPendingScan | None = None
+) -> list[CursorPendingToolCall]:
     """Return the gated tool calls currently awaiting a human in *store_path*.
 
     Scans every blob for embedded JSON messages and classifies each
@@ -502,42 +640,17 @@ def read_cursor_pending_tool_calls(store_path: Path) -> list[CursorPendingToolCa
     so it is safe to run alongside the forwarder tailing the same store.
 
     :param store_path: This session's cursor ``store.db``.
+    :param scan: State kept between polls. When given, only rows added since
+        the previous call are parsed (see :class:`CursorPendingScan`); when
+        omitted, the whole store is scanned.
     :returns: Active pending tool calls (cursor shows them one at a time, but the
         list supports more than one defensively), in first-seen order.
     """
-    pending: dict[str, CursorPendingToolCall] = {}
-    committed: set[str] = set()
-    resolved: set[str] = set()
-    for _rowid, _blob_id, data in _read_blob_rows(store_path, 0):
-        raw = bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("utf-8")
-        for obj in _iter_embedded_json_objects(raw):
-            content = obj.get("content")
-            if not isinstance(content, list):
-                continue
-            marker = _pending_started_ms(obj)
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                part_type = part.get("type")
-                tool_call_id = part.get("toolCallId")
-                if not isinstance(tool_call_id, str):
-                    continue
-                if part_type == "tool-call":
-                    if marker is not None:
-                        tool_name = part.get("toolName")
-                        args = part.get("args")
-                        pending[tool_call_id] = CursorPendingToolCall(
-                            tool_call_id=tool_call_id,
-                            tool_name=tool_name if isinstance(tool_name, str) else "tool",
-                            args=args if isinstance(args, dict) else {},
-                        )
-                    else:
-                        committed.add(tool_call_id)
-                elif part_type == "tool-result":
-                    resolved.add(tool_call_id)
-    return [
-        call for tcid, call in pending.items() if tcid not in committed and tcid not in resolved
-    ]
+    if scan is not None:
+        return scan.read(store_path)
+    full = CursorPendingScan()
+    full.fold(_read_blob_rows(store_path, 0))
+    return full.calls()
 
 
 def _preview_for_args(args: dict[str, object]) -> str:
@@ -849,6 +962,7 @@ async def supervise_cursor_transcript_elicitations(
     # still inside the settle window (not yet surfaced).
     active: dict[str, dict[str, object]] = {}
     first_seen: dict[str, float] = {}
+    scan = CursorPendingScan()
     auto_accept_attempts: dict[str, _YoloAcceptRetry] = {}
     next_auto_accept_at = 0.0
     store_path: Path | None = None
@@ -864,7 +978,7 @@ async def supervise_cursor_transcript_elicitations(
                         _discover_store, workspace, launch_epoch_ms
                     )
                 pending_calls = (
-                    await asyncio.to_thread(read_cursor_pending_tool_calls, store_path)
+                    await asyncio.to_thread(read_cursor_pending_tool_calls, store_path, scan)
                     if store_path is not None
                     else []
                 )
