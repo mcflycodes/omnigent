@@ -435,19 +435,55 @@ def test_incremental_scan_keeps_latest_args_for_a_still_pending_call(tmp_path: P
     assert [call.args for call in calls] == [{"command": "pwd"}]
 
 
-def _replace_store(store: Path, blobs: list[bytes]) -> None:
-    """Swap in a new file (new inode) with the same row count and newest row.
-
-    Only the file identity tells this store apart from the one already read.
-    """
+def _newest_blob(store: Path) -> bytes:
     con = _sqlite3.connect(str(store))
     try:
         (newest,) = con.execute("SELECT data FROM blobs ORDER BY rowid DESC LIMIT 1").fetchone()
     finally:
         con.close()
+    return bytes(newest)
+
+
+def _replace_store(store: Path, blobs: list[bytes]) -> None:
+    """Swap in a new file (new inode) with the same row count and newest row."""
     fresh = store.with_name("fresh.db")
-    _append_cursor_blobs(fresh, [*blobs, bytes(newest)])
+    _append_cursor_blobs(fresh, [*blobs, _newest_blob(store)])
     fresh.replace(store)
+
+
+_APPENDED_CALL = _framed(_pending_tool_call_obj("call_c", "Shell", {"command": "ls"}))
+
+
+def _rebuild_rows(store: Path, blobs: list[bytes], *, truncate: bool, append: bool) -> None:
+    """Rebuild the same file with the old row count and newest blob kept.
+
+    Only the rows below the newest one change, so a count or last-blob check
+    alone cannot see it.
+    """
+    newest = _newest_blob(store)
+    if truncate:
+        with store.open("r+b") as handle:
+            handle.truncate(0)
+    else:
+        con = _sqlite3.connect(str(store))
+        try:
+            con.execute("DELETE FROM blobs")
+            con.commit()
+        finally:
+            con.close()
+    _append_cursor_blobs(store, [*blobs, newest, *([_APPENDED_CALL] if append else [])])
+
+
+def _rows_rebuilt(store: Path, blobs: list[bytes]) -> None:
+    _rebuild_rows(store, blobs, truncate=False, append=False)
+
+
+def _rows_rebuilt_then_appended(store: Path, blobs: list[bytes]) -> None:
+    _rebuild_rows(store, blobs, truncate=False, append=True)
+
+
+def _truncated_rebuilt_then_appended(store: Path, blobs: list[bytes]) -> None:
+    _rebuild_rows(store, blobs, truncate=True, append=True)
 
 
 def _truncate_store(store: Path, blobs: list[bytes]) -> None:
@@ -485,8 +521,19 @@ def _rewrite_first_blob(store: Path, _blobs: list[bytes]) -> None:
         (_truncate_store, []),
         (_reuse_last_rowid, []),
         (_rewrite_first_blob, ["Write", "Delete"]),
+        (_rows_rebuilt, ["Write"]),
+        (_rows_rebuilt_then_appended, ["Write", "Shell"]),
+        (_truncated_rebuilt_then_appended, ["Write", "Shell"]),
     ],
-    ids=["replaced", "truncated", "rowid-reused", "blob-rewritten"],
+    ids=[
+        "replaced",
+        "truncated",
+        "rowid-reused",
+        "blob-rewritten",
+        "rows-rebuilt",
+        "rows-rebuilt-then-appended",
+        "truncated-rebuilt-then-appended",
+    ],
 )
 def test_incremental_scan_rescans_when_earlier_rows_change(
     tmp_path: Path, mutate: Callable[[Path, list[bytes]], None], expected: list[str]
@@ -494,7 +541,8 @@ def test_incremental_scan_rescans_when_earlier_rows_change(
     """Any change at or below the last rowid read forces a full, correct rescan.
 
     Folding only the new rows would keep stale calls (replaced, truncated,
-    reused rowid) or the wrong order (a re-written blob moves to the end).
+    reused rowid, rebuilt) or the wrong order (a re-written blob moves to the
+    end).
     """
     store = tmp_path / "store.db"
     _append_cursor_blobs(

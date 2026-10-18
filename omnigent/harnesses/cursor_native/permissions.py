@@ -486,23 +486,24 @@ def _pending_started_ms(obj: dict[str, object]) -> int | None:
 class CursorPendingScan:
     """Per-supervisor state that lets each poll read only the new store rows.
 
-    Cursor writes blobs with ``INSERT OR REPLACE`` keyed on a content hash and
-    never updates a row in place, so rows only append. A re-written blob is
-    deleted and re-appended at a new rowid, which lowers the count of rows at
-    or below ``last_rowid``; that, a different blob at ``last_rowid``, or a
-    replaced file triggers a full rescan, so the result always equals a scan
-    from row 0.
+    Cursor keys each blob on a hash of its data and never updates a row in
+    place, but it can delete rows, re-write a blob at a new rowid, or reuse a
+    freed rowid. So each read also checks a digest of the ``(rowid, id)`` pairs
+    at or below ``last_rowid`` (equal pairs mean equal rows, since ids are
+    content hashes); any change there, or a replaced file, triggers a full
+    rescan, so the result always equals a scan from row 0.
 
     Folded state keeps calls still pending (first-seen order, latest args) and
     the ids already committed or resolved, which can never become pending
-    again.
+    again. ``finished`` grows by one id per tool call (about 140 bytes each)
+    for the supervisor's life; evicting one would let a late marker resurface
+    a finished call.
     """
 
     store_path: Path | None
     file_id: tuple[int, int] | None
     last_rowid: int
-    last_blob_id: str | None
-    row_count: int
+    prefix_digest: bytes | None
     pending: dict[str, CursorPendingToolCall]
     finished: set[str]
 
@@ -514,8 +515,7 @@ class CursorPendingScan:
         self.store_path = store_path
         self.file_id = file_id
         self.last_rowid = 0
-        self.last_blob_id = None
-        self.row_count = 0
+        self.prefix_digest = None
         self.pending = {}
         self.finished = set()
 
@@ -566,37 +566,44 @@ class CursorPendingScan:
         file_id = (stat.st_dev, stat.st_ino)
         if store_path != self.store_path or file_id != self.file_id:
             self.reset(store_path, file_id)
-        delta = _read_store_delta(store_path, self.last_rowid)
-        if delta is not None:
-            row_count, blob_id_at_last, rows = delta
-            if blob_id_at_last != self.last_blob_id or row_count - len(rows) != self.row_count:
+        snapshot = _read_store_snapshot(store_path, self.last_rowid)
+        if snapshot is not None and self.prefix_digest is not None:
+            prefix_digest, _store_digest, _rows = snapshot
+            if prefix_digest != self.prefix_digest:
                 # Rows at or below the high-water mark changed since the last read.
                 self.reset(store_path, file_id)
-                delta = _read_store_delta(store_path, 0)
-        if delta is None:
+                snapshot = _read_store_snapshot(store_path, 0)
+        if snapshot is None:
             # Same answer as a failed full scan; start over on the next read.
             self.reset(None, None)
             return []
-        row_count, _blob_id_at_last, rows = delta
+        _prefix_digest, store_digest, rows = snapshot
         try:
             self.fold(rows)
         except Exception:
             self.reset(None, None)
             raise
-        self.row_count = row_count
+        # Every row in this snapshot is now folded, so the new prefix is all of it.
+        self.prefix_digest = store_digest
         if rows:
-            self.last_rowid, self.last_blob_id = rows[-1][0], rows[-1][1]
+            self.last_rowid = rows[-1][0]
         return self.calls()
 
 
-def _read_store_delta(
-    store_path: Path, last_rowid: int
-) -> tuple[int, str | None, list[tuple[int, str, object]]] | None:
-    """Read ``(row count, id at last_rowid, rows after it)`` from one snapshot.
+# Canonical ``(rowid, id)`` pairs up to a rowid. ``+rowid`` keeps the planner on
+# the small ``id`` index instead of the blob pages; ``quote`` keeps it unambiguous.
+_ROWID_PAIRS_SQL = "SELECT group_concat(rowid || ':' || quote(id)) FROM blobs WHERE +rowid <= ?"
 
-    Connects like :func:`_read_blob_rows` (WAL-aware ``mode=ro``, then a plain
-    connection) and runs every query in one read transaction, so the count and
-    the new rows agree. Returns ``None`` when the store can't be read.
+
+def _read_store_snapshot(
+    store_path: Path, last_rowid: int
+) -> tuple[bytes, bytes, list[tuple[int, str, object]]] | None:
+    """Read ``(prefix digest, store digest, rows after last_rowid)`` from one snapshot.
+
+    The digests cover the ``(rowid, id)`` pairs at or below ``last_rowid`` and
+    in the whole table. Connects like :func:`_read_blob_rows` (WAL-aware
+    ``mode=ro``, then a plain connection) in one read transaction, so the
+    digests and the new rows agree. Returns ``None`` when the store can't be read.
     """
     for uri, use_uri in ((f"file:{store_path}?mode=ro", True), (str(store_path), False)):
         try:
@@ -605,16 +612,19 @@ def _read_store_delta(
             continue
         try:
             con.execute("BEGIN")
-            (row_count,) = con.execute("SELECT COUNT(*) FROM blobs").fetchone()
-            at_last = con.execute("SELECT id FROM blobs WHERE rowid = ?", (last_rowid,)).fetchone()
+            (prefix,) = con.execute(_ROWID_PAIRS_SQL, (last_rowid,)).fetchone()
             rows = con.execute(
                 "SELECT rowid, id, data FROM blobs WHERE rowid > ? ORDER BY rowid", (last_rowid,)
             ).fetchall()
-            return int(row_count), at_last[0] if at_last else None, rows
+            pairs = con.execute(_ROWID_PAIRS_SQL, (rows[-1][0],)).fetchone()[0] if rows else prefix
         except sqlite3.Error:
             continue
         finally:
             con.close()
+        prefix_digest = hashlib.sha256(str(prefix or "").encode("utf-8")).digest()
+        if not rows:
+            return prefix_digest, prefix_digest, rows
+        return prefix_digest, hashlib.sha256(str(pairs or "").encode("utf-8")).digest(), rows
     return None
 
 
