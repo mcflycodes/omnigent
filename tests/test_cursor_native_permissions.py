@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import hashlib
 import json as _json
+import os
 import sqlite3 as _sqlite3
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -613,6 +614,46 @@ def test_incremental_scan_rescans_when_earlier_rows_change(
     assert _pending_names(incremental) == expected
 
 
+def test_incremental_scan_rescans_after_a_rebuild_that_restores_mtime(
+    tmp_path: Path, scan: cnp.CursorPendingScan
+) -> None:
+    """A same-inode rebuild that keeps size and mtime is still caught, by ctime.
+
+    The rebuild also lands on the same change counter, so ``data_version`` on
+    the kept connection does not move either.
+    """
+    store = tmp_path / "store.db"
+    _append_cursor_blobs(
+        store,
+        [
+            _framed(_pending_tool_call_obj("call_a", "Delete", {"path": "/a"})),
+            _framed(_pending_tool_call_obj("call_b", "Write", {"path": "/b"})),
+        ],
+    )
+    assert _pending_names(read_cursor_pending_tool_calls(store, scan)) == ["Delete", "Write"]
+    before = store.stat()
+
+    _rebuild_rows(
+        store, [_json.dumps(_tool_result_obj("call_a")).encode()], truncate=True, append=False
+    )
+    # Restoring the times sets ctime to now; repeat until the clock has ticked.
+    for _ in range(1_000_000):
+        os.utime(store, ns=(before.st_atime_ns, before.st_mtime_ns))
+        if store.stat().st_ctime_ns != before.st_ctime_ns:
+            break
+    after = store.stat()
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    assert after.st_ctime_ns != before.st_ctime_ns
+
+    incremental = read_cursor_pending_tool_calls(store, scan)
+    assert incremental == read_cursor_pending_tool_calls(store)
+    assert _pending_names(incremental) == ["Write"]
+
+
 def test_incremental_scan_rescans_after_a_parse_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scan: cnp.CursorPendingScan
 ) -> None:
@@ -709,6 +750,36 @@ def test_incremental_scan_sees_a_commit_that_leaves_stat_unchanged(
     _append_cursor_blobs(store, [_json.dumps(_tool_result_obj("call_a")).encode()])
 
     assert read_cursor_pending_tool_calls(store, scan) == []
+
+
+def test_scan_closed_as_a_read_releases_its_lock_still_closes_the_connection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scan: cnp.CursorPendingScan
+) -> None:
+    """A close landing after the read's last check, just before it unlocks, still closes."""
+    store = tmp_path / "store.db"
+    _append_cursor_blobs(store, [_framed(_pending_tool_call_obj("call_a", "Delete", {}))])
+    _statements, connections = _trace_store_connections(monkeypatch)
+    read_lock = scan._lock
+
+    class _CloseBeforeRelease:
+        """The read lock, with a close (e.g. supervisor cancellation) just before release."""
+
+        def acquire(self, blocking: bool = True) -> bool:
+            return read_lock.acquire(blocking)
+
+        def release(self) -> None:
+            read_lock.release()
+
+        def __enter__(self) -> None:
+            read_lock.acquire()
+
+        def __exit__(self, *_exc: object) -> None:
+            scan.close()
+            read_lock.release()
+
+    monkeypatch.setattr(scan, "_lock", _CloseBeforeRelease())
+    assert _pending_names(read_cursor_pending_tool_calls(store, scan)) == ["Delete"]
+    assert len(connections) == 1 and _is_closed(connections[0])
 
 
 def test_scan_closed_during_a_read_releases_the_connection_after_it(

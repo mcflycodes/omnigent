@@ -509,7 +509,8 @@ class CursorPendingScan:
 
     Reads are serialized by a lock and may run on any thread. ``close()`` (or
     leaving ``async with``) releases the connection; during a read, the read
-    releases it when done.
+    releases it when done. A second small lock makes that handoff atomic, so
+    exactly one side closes.
     """
 
     store_path: Path | None
@@ -522,6 +523,8 @@ class CursorPendingScan:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._reading = False
         self._closed = False
         self._connection: sqlite3.Connection | None = None
         self._data_version: int | None = None
@@ -535,12 +538,10 @@ class CursorPendingScan:
 
     def close(self) -> None:
         """Release the kept connection now, or when the read in progress ends."""
-        self._closed = True
-        if self._lock.acquire(blocking=False):
-            try:
+        with self._state_lock:
+            self._closed = True
+            if not self._reading:
                 self._close_connection()
-            finally:
-                self._lock.release()
 
     def _close_connection(self) -> None:
         if self._connection is not None:
@@ -599,11 +600,15 @@ class CursorPendingScan:
     def read(self, store_path: Path) -> list[CursorPendingToolCall]:
         """Fold the rows added since the last read and return pending calls."""
         with self._lock:
+            with self._state_lock:
+                self._reading = True
             try:
                 return self._read(store_path)
             finally:
-                if self._closed:
-                    self._close_connection()
+                with self._state_lock:
+                    self._reading = False
+                    if self._closed:
+                        self._close_connection()
 
     def _read(self, store_path: Path) -> list[CursorPendingToolCall]:
         signature = _store_signature(store_path)
@@ -650,8 +655,9 @@ class CursorPendingScan:
         return data_version == self._data_version
 
 
-# ``(st_dev, st_ino)`` of ``store.db``, its size and mtime, and the same for ``-wal``.
-_StoreSignature = tuple[tuple[int, int], int, int, tuple[int, int, int] | None]
+# ``(st_dev, st_ino)`` of ``store.db``, its size, mtime and ctime, and the same for
+# ``-wal``. ctime catches a rewrite that restores the old mtime.
+_StoreSignature = tuple[tuple[int, int], int, int, int, tuple[int, int, int, int] | None]
 
 
 def _store_signature(store_path: Path) -> _StoreSignature | None:
@@ -665,8 +671,8 @@ def _store_signature(store_path: Path) -> _StoreSignature | None:
     except OSError:
         wal_signature = None
     else:
-        wal_signature = (wal.st_ino, wal.st_size, wal.st_mtime_ns)
-    return (db.st_dev, db.st_ino), db.st_size, db.st_mtime_ns, wal_signature
+        wal_signature = (wal.st_ino, wal.st_size, wal.st_mtime_ns, wal.st_ctime_ns)
+    return (db.st_dev, db.st_ino), db.st_size, db.st_mtime_ns, db.st_ctime_ns, wal_signature
 
 
 def _open_store_snapshot(
