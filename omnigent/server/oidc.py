@@ -65,6 +65,7 @@ def mint_session_token(
     auth_time: int | None = None,
     session_id: str | None = None,
     issued_at: int | None = None,
+    cli_login_ticket: str | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -91,6 +92,8 @@ def mint_session_token(
     :param issued_at: The ``iat`` to stamp, from the caller's single clock
         reading, so ``exp`` is exactly ``issued_at + ttl_seconds``.
         Defaults to now.
+    :param cli_login_ticket: Ticket authenticated by the browser callback,
+        never included in runner, refresh, or CLI-issued credentials.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time()) if issued_at is None else issued_at
@@ -106,6 +109,8 @@ def mint_session_token(
         payload["auth_time"] = auth_time
     if session_id is not None:
         payload["sid"] = session_id
+    if cli_login_ticket is not None:
+        payload["cli_login_ticket"] = cli_login_ticket
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 
@@ -116,6 +121,7 @@ def mint_session_cookie(
     provider: str,
     *,
     account_generation: str | None = None,
+    cli_login_ticket: str | None = None,
 ) -> str:
     """Mint a signed session cookie JWT for a fresh interactive login.
 
@@ -130,6 +136,7 @@ def mint_session_cookie(
     :param ttl_hours: Session lifetime in hours.
     :param provider: Identity provider name, e.g. ``"google"``
         or ``"github"``. Stored as an informational claim.
+    :param cli_login_ticket: Ticket authenticated by the browser callback.
     :returns: An HS256-signed JWT string.
     """
     # One clock reading, so ``auth_time`` equals ``iat`` exactly at login.
@@ -143,6 +150,7 @@ def mint_session_cookie(
         auth_time=now,
         session_id=secrets.token_urlsafe(16),
         issued_at=now,
+        cli_login_ticket=cli_login_ticket,
     )
 
 
