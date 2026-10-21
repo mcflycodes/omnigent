@@ -711,15 +711,13 @@ def create_auth_router(
         recorded = await asyncio.to_thread(auth_provider.end_browser_session, request)
         base_path = getattr(request.app.state, "base_path", "")
         if not recorded:
-            import html as _html
-
-            safe_base = _html.escape(base_path, quote=True)
+            safe_base = html.escape(base_path, quote=True)
             return HTMLResponse(
                 status_code=503,
                 content=(
                     "<html><body style='font-family:system-ui;text-align:center;padding:60px'>"
                     "<h2>Sign-out failed</h2>"
-                    f"<p>{_html.escape(LOGOUT_NOT_RECORDED_MESSAGE)}</p>"
+                    f"<p>{html.escape(LOGOUT_NOT_RECORDED_MESSAGE)}</p>"
                     f"<p><a href='{safe_base}/auth/logout'>Try again</a> · "
                     f"<a href='{safe_base}/'>Back to the app</a></p>"
                     "</body></html>"

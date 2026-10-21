@@ -548,7 +548,10 @@ and host tokens and refresh grants signed with it, so those need
 `omnigent login` again.
 ### Ending accounts sessions
 
-An `accounts` session lasts `OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS` (default 8).
+An `accounts` browser session uses `OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS`
+(default 8) as its idle limit and can continue while active until
+`OMNIGENT_ACCOUNTS_SESSION_MAX_LIFETIME_HOURS` (default 720). See
+[Browser sessions](#browser-sessions) for details.
 To end one user's sessions sooner, change the password (Account menu → Change
 password) or have an admin reset it (Members → Reset). Either one invalidates
 the browser sessions, CLI logins, refresh tokens, and unused sign-in links
@@ -579,6 +582,7 @@ and invite links are looked up by value, not signed with the secret, so they
 keep working until they expire (sign-in links after
 `OMNIGENT_ACCOUNTS_MAGIC_TTL_MINUTES`, default 10; invites after
 `OMNIGENT_ACCOUNTS_INVITE_TTL_HOURS`, default 72).
+
 ### Browser origin allowlist
 
 Independent of the auth mode above, the server also checks the browser
