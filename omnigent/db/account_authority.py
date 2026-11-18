@@ -47,6 +47,17 @@ def account_checks_scope(enabled: bool) -> Iterator[None]:
         _account_checks_enabled.reset(token)
 
 
+def saved_generation_is_current(saved: str | None, current: str | None) -> bool:
+    """Whether a durable job's saved generation still matches its owner's account row.
+
+    External auth (OIDC, header, custom) saves no generation and keeps its own
+    account lifecycle. Accounts mode and any saved generation require a match.
+    """
+    if saved is None and not _account_checks_enabled.get():
+        return True
+    return saved == current
+
+
 def bind_account_authority(user_id: str, generation: str) -> None:
     """Capture the identity authenticated by this request or durable job."""
     _authority.set(AccountAuthority(user_id, generation, current_workspace_id()))

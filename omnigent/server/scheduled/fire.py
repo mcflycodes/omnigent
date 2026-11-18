@@ -80,7 +80,7 @@ from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 
-from omnigent.db.account_authority import account_authority_scope
+from omnigent.db.account_authority import account_authority_scope, saved_generation_is_current
 from omnigent.db.db_models import workspace_scope
 from omnigent.debug_logging import set_current_session_id
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
@@ -1597,12 +1597,15 @@ async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
 
     A NULL owner (single-user / OSS) always resolves to
     :data:`RESERVED_USER_LOCAL` and is never considered deleted; without a
-    permission store there is no account to check against.
+    permission store there is no account to check against. A deleted owner is
+    inactive in every auth mode; generations follow the app's auth provider.
     """
     if task.user_id is None or deps.permission_store is None:
         return False
     owner = await asyncio.to_thread(deps.permission_store.get_user, task.user_id)
-    return owner is None or owner.account_generation != task.account_generation
+    return owner is None or not saved_generation_is_current(
+        task.account_generation, owner.account_generation
+    )
 
 
 async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:

@@ -9,6 +9,7 @@ from omnigent.db.account_authority import (
     account_authority_scope,
     account_checks_scope,
     require_active_account,
+    saved_generation_is_current,
     target_account_scope,
 )
 from omnigent.db.db_models import SqlUser, workspace_scope
@@ -62,3 +63,25 @@ def test_generation_checks_respect_workspace(db_uri):
             with pytest.raises(OmnigentError) as error:
                 require_active_account(session, "alice", generation="a" * 32)
             assert error.value.code == ErrorCode.UNAUTHORIZED
+
+
+@pytest.mark.parametrize(
+    ("checks_enabled", "saved", "current", "is_current"),
+    [
+        # External auth (e.g. OIDC) saves no generation and keeps its own lifecycle.
+        (False, None, "a" * 32, True),
+        (False, None, None, True),
+        # A saved generation is still enforced under external auth.
+        (False, "a" * 32, "a" * 32, True),
+        (False, "a" * 32, "b" * 32, False),
+        (False, "a" * 32, None, False),
+        # Accounts mode: an unsaved generation cannot outlive a re-registration.
+        (True, None, None, True),
+        (True, None, "a" * 32, False),
+        (True, "a" * 32, "a" * 32, True),
+        (True, "a" * 32, "b" * 32, False),
+    ],
+)
+def test_saved_generation_follows_the_auth_mode(checks_enabled, saved, current, is_current):
+    with account_checks_scope(checks_enabled):
+        assert saved_generation_is_current(saved, current) is is_current

@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from omnigent.db.account_authority import account_checks_scope
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.auth import (
     LEVEL_EDIT,
@@ -1088,6 +1089,63 @@ async def test_revoked_identity_of_a_deleted_owner_disables_the_task(store, monk
     assert finishes == [("failed", "owner_deleted")]
     # The disabled task's finished history is purged with it.
     assert store.get(claimed.task.id) is None
+
+
+async def test_claimed_fire_of_an_external_auth_owner_without_a_generation_runs(store) -> None:
+    # The owner's local row has a generation; OIDC recorded none on the task.
+    claimed = _claim(store)
+    task = replace(claimed.task, user_id="alice", account_generation=None)
+    dispatch = AsyncMock()
+    executor = ClaimedRunExecutor(
+        _deps(
+            store,
+            permission_store=FakePermissionStore(users={"alice"}, generations={"alice": "g1"}),
+            host_store=FakeHostStore({_HOST_ID: _FakeHost(_HOST_ID, "alice")}),
+        ),
+        launch_dispatch=dispatch,
+    )
+    with account_checks_scope(False):
+        await executor.fire(task, claimed.lease)
+
+    dispatch.assert_awaited_once()
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("running", None)
+    assert store.get(claimed.task.id).state == "active"
+
+
+@pytest.mark.parametrize(
+    ("accounts_mode", "users", "task_generation", "error_code"),
+    [
+        (False, {"alice"}, None, "reauthorization_required"),
+        (True, {"alice"}, "g-old", "owner_deleted"),
+        (True, {"alice"}, None, "owner_deleted"),
+        (False, set(), None, "owner_deleted"),
+        (True, set(), "g-current", "owner_deleted"),
+    ],
+)
+async def test_revoked_identity_disables_only_an_inactive_owner_registration(
+    store, accounts_mode: bool, users: set[str], task_generation: str | None, error_code: str
+) -> None:
+    claimed = _claim(store)
+    task = replace(claimed.task, user_id="alice", account_generation=task_generation)
+    executor = ClaimedRunExecutor(
+        _deps(
+            store,
+            permission_store=FakePermissionStore(users=users, generations={"alice": "g-current"}),
+        ),
+        fire_identity=_failing_identity(FireIdentityRevoked("owner removed")),
+        launch_dispatch=AsyncMock(),
+    )
+    with account_checks_scope(accounts_mode):
+        await executor.fire(task, claimed.lease)
+
+    if error_code == "owner_deleted":
+        # The disabled task's finished history is purged with it.
+        assert store.get(claimed.task.id) is None
+    else:
+        [run] = _runs(store, claimed.task)
+        assert (run.status, run.error_code) == ("failed", error_code)
+        assert store.get(claimed.task.id).state == "active"
 
 
 @pytest.mark.parametrize("outcome", ["bound", "failed_after_binding", "tracker_failed", "raised"])

@@ -33,6 +33,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 
+from omnigent.db.account_authority import account_checks_scope
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import (
@@ -434,9 +435,12 @@ class FakePermissionStore:
         fail_grant: bool = False,
         fail_grant_users: set[str] | None = None,
         users: set[str] | None = None,
+        generations: Mapping[str, str] | None = None,
         task_grantees: list[str] | None = None,
     ) -> None:
         self.ensured: list[str] = []
+        # Each owner's current account generation; absent owners have none.
+        self.generations = dict(generations or {})
         self.grants: list[tuple[str, str, int]] = []
         # The automation's grantees; ``None`` is a store without automation grants.
         self.task_grantees = task_grantees
@@ -462,7 +466,9 @@ class FakePermissionStore:
     def get_user(self, user_id: str):
         from omnigent.entities.account import Account
 
-        return Account(user_id, False, None, None, False) if self.user_exists(user_id) else None
+        if not self.user_exists(user_id):
+            return None
+        return Account(user_id, False, None, None, False, self.generations.get(user_id))
 
     def check_access(self, user_id: str | None, conversation_id: str, required_level: int) -> bool:
         return conversation_id not in self.unowned
@@ -1152,6 +1158,53 @@ async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "owner_deleted"
     assert "alice" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("accounts_mode", "users", "task_generation", "disabled"),
+    [
+        # OIDC/external auth records no generation; the owner's local row may have one.
+        (False, {"alice"}, None, False),
+        # Accounts mode: a rotated or re-registered owner still disables the task.
+        (True, {"alice"}, "g-old", True),
+        (True, {"alice"}, None, True),
+        # A generation the task did record is enforced under external auth too.
+        (False, {"alice"}, "g-old", True),
+        # A deleted owner is refused in every mode.
+        (False, set(), None, True),
+        (True, set(), "g-current", True),
+    ],
+)
+async def test_owner_check_follows_the_auth_providers_account_lifecycle(
+    accounts_mode: bool, users: set[str], task_generation: str | None, disabled: bool
+) -> None:
+    perm = FakePermissionStore(users=users, generations={"alice": "g-current"})
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(user_id="alice", account_generation=task_generation)}
+    )
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, permission_store=perm, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    with account_checks_scope(accounts_mode):
+        await on_fire(0, "task_1")
+        await _drain()
+
+    if disabled:
+        assert launched == []
+        assert {"id": "task_1", "state": "deleted"} in store.updates
+        assert [run["error_code"] for run in store.runs] == ["owner_deleted"]
+    else:
+        assert len(launched) == 1
+        assert {"id": "task_1", "state": "deleted"} not in store.updates
+        assert [run["status"] for run in store.runs] == ["running"]
 
 
 def _claude_agent_deps(
